@@ -57,7 +57,7 @@ impl Context<'_> {
 
 type Supertraits = Punctuated<TypeParamBound, Token![+]>;
 
-pub fn expand(input: &mut Item, is_local: bool) {
+pub fn expand(input: &mut Item, is_local: bool, try_alloc: bool) {
     match input {
         Item::Trait(input) => {
             let context = Context::Trait {
@@ -73,13 +73,13 @@ pub fn expand(input: &mut Item, is_local: bool) {
                         method.attrs.push(parse_quote!(#[must_use]));
                         if let Some(block) = block {
                             has_self |= has_self_in_block(block);
-                            transform_block(context, sig, block);
+                            transform_block(context, sig, block, try_alloc);
                             method.attrs.push(lint_suppress_with_body());
                         } else {
                             method.attrs.push(lint_suppress_without_body());
                         }
                         let has_default = method.default.is_some();
-                        transform_sig(context, sig, has_self, has_default, is_local);
+                        transform_sig(context, sig, has_self, has_default, is_local, try_alloc);
                     }
                 }
             }
@@ -111,8 +111,8 @@ pub fn expand(input: &mut Item, is_local: bool) {
                     if sig.asyncness.is_some() {
                         let block = &mut method.block;
                         let has_self = has_self_in_sig(sig) || has_self_in_block(block);
-                        transform_block(context, sig, block);
-                        transform_sig(context, sig, has_self, false, is_local);
+                        transform_block(context, sig, block, try_alloc);
+                        transform_sig(context, sig, has_self, false, is_local, try_alloc);
                         method.attrs.push(lint_suppress_with_body());
                     }
                 }
@@ -160,6 +160,7 @@ fn transform_sig(
     has_self: bool,
     has_default: bool,
     is_local: bool,
+    try_alloc: bool,
 ) {
     sig.fn_token.span = sig.asyncness.take().unwrap().span;
 
@@ -284,10 +285,19 @@ fn transform_sig(
     } else {
         quote_spanned!(ret_span=> ::core::marker::Send + 'async_trait)
     };
-    sig.output = parse_quote_spanned! {ret_span=>
-        -> ::core::pin::Pin<Box<
-            dyn ::core::future::Future<Output = #ret> + #bounds
-        >>
+
+    sig.output = if try_alloc {
+        parse_quote_spanned! {ret_span=>
+            -> ::core::result::Result<::core::pin::Pin<Box<
+                dyn ::core::future::Future<Output = #ret> + #bounds
+            >>, ::core::alloc::AllocError>
+        }
+    } else {
+        parse_quote_spanned! {ret_span=>
+            -> ::core::pin::Pin<Box<
+                dyn ::core::future::Future<Output = #ret> + #bounds
+            >>
+        }
     };
 }
 
@@ -308,7 +318,7 @@ fn transform_sig(
 //
 //         ___ret
 //     })
-fn transform_block(context: Context, sig: &mut Signature, block: &mut Block) {
+fn transform_block(context: Context, sig: &mut Signature, block: &mut Block, try_alloc: bool) {
     if let Some(Stmt::Item(syn::Item::Verbatim(item))) = block.stmts.first() {
         if block.stmts.len() == 1 && item.to_string() == ";" {
             return;
@@ -382,9 +392,15 @@ fn transform_block(context: Context, sig: &mut Signature, block: &mut Block) {
             }
         }
     };
-    let box_pin = quote_spanned!(block.brace_token.span=>
-        Box::pin(async move { #let_ret })
-    );
+
+    let box_pin = if try_alloc {
+        quote_spanned!(block.brace_token.span=>
+            Ok(Box::into_pin(Box::try_new(async move { #let_ret })?))
+        )
+    } else {
+        quote_spanned!(block.brace_token.span=>
+            Box::pin(async move { #let_ret }))
+    };
     block.stmts = parse_quote!(#box_pin);
 }
 

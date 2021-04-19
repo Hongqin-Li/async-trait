@@ -333,6 +333,14 @@ use syn::parse_macro_input;
 pub fn async_trait(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as Args);
     let mut item = parse_macro_input!(input as Item);
-    expand(&mut item, args.local);
+    expand(&mut item, args.local, false);
+    TokenStream::from(quote!(#item))
+}
+
+#[proc_macro_attribute]
+pub fn async_trait_try(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as Args);
+    let mut item = parse_macro_input!(input as Item);
+    expand(&mut item, args.local, true);
     TokenStream::from(quote!(#item))
 }
