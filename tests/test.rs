@@ -8,13 +8,40 @@
     clippy::missing_panics_doc,
     clippy::trivially_copy_pass_by_ref
 )]
+#![feature(generic_associated_types)]
 
-use async_trait::async_trait;
+use async_trait::{async_trait, async_trait_static};
 
 pub mod executor;
 
 // Dummy module to check that the expansion refer to rust's core crate
 mod core {}
+
+#[async_trait_static]
+trait StaticTrait {
+    type Assoc;
+
+    async fn selfvalue(self)
+    where
+        Self: Sized;
+
+    async fn selfref(&self);
+
+    async fn selfmut(&mut self);
+
+    async fn required() -> Self::Assoc;
+
+    async fn elided_lifetime(_x: &str);
+
+    async fn explicit_lifetime<'a>(_x: &'a str);
+
+    // TODO:
+    // async fn generic_type_param<T: Send>(x: Box<T>) -> T ;
+
+    async fn calls(&self);
+
+    async fn calls_mut(&mut self);
+}
 
 #[async_trait]
 trait Trait {

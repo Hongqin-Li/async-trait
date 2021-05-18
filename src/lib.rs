@@ -329,11 +329,18 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::parse_macro_input;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+    Default,
+    TryAlloc,
+    Static,
+}
+
 #[proc_macro_attribute]
 pub fn async_trait(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as Args);
     let mut item = parse_macro_input!(input as Item);
-    expand(&mut item, args.local, false);
+    expand(&mut item, args.local, Mode::Default);
     TokenStream::from(quote!(#item))
 }
 
@@ -341,6 +348,14 @@ pub fn async_trait(args: TokenStream, input: TokenStream) -> TokenStream {
 pub fn async_trait_try(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as Args);
     let mut item = parse_macro_input!(input as Item);
-    expand(&mut item, args.local, true);
+    expand(&mut item, args.local, Mode::TryAlloc);
+    TokenStream::from(quote!(#item))
+}
+
+#[proc_macro_attribute]
+pub fn async_trait_static(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as Args);
+    let mut item = parse_macro_input!(input as Item);
+    expand(&mut item, args.local, Mode::Static);
     TokenStream::from(quote!(#item))
 }

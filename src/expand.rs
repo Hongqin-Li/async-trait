@@ -1,16 +1,17 @@
-use crate::lifetime::CollectLifetimes;
 use crate::parse::Item;
 use crate::receiver::{has_self_in_block, has_self_in_sig, mut_pat, ReplaceSelf};
-use proc_macro2::TokenStream;
+use crate::{lifetime::CollectLifetimes, Mode};
+use convert_case::{Case, Casing};
+use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote, quote_spanned, ToTokens};
 use std::collections::BTreeSet as Set;
-use syn::punctuated::Punctuated;
 use syn::visit_mut::{self, VisitMut};
 use syn::{
     parse_quote, Attribute, Block, FnArg, GenericParam, Generics, Ident, ImplItem, Lifetime, Pat,
     PatIdent, Receiver, ReturnType, Signature, Stmt, Token, TraitItem, Type, TypeParamBound,
     TypePath, WhereClause,
 };
+use syn::{punctuated::Punctuated, TraitItemType};
 
 macro_rules! parse_quote_spanned {
     ($span:expr=> $($t:tt)*) => {
@@ -57,13 +58,15 @@ impl Context<'_> {
 
 type Supertraits = Punctuated<TypeParamBound, Token![+]>;
 
-pub fn expand(input: &mut Item, is_local: bool, try_alloc: bool) {
+pub(crate) fn expand(input: &mut Item, is_local: bool, mode: Mode) {
     match input {
         Item::Trait(input) => {
             let context = Context::Trait {
                 generics: &input.generics,
                 supertraits: &input.supertraits,
             };
+
+            let mut fut_items = Vec::new();
             for inner in &mut input.items {
                 if let TraitItem::Method(method) = inner {
                     let sig = &mut method.sig;
@@ -73,14 +76,30 @@ pub fn expand(input: &mut Item, is_local: bool, try_alloc: bool) {
                         method.attrs.push(parse_quote!(#[must_use]));
                         if let Some(block) = block {
                             has_self |= has_self_in_block(block);
-                            transform_block(context, sig, block, try_alloc);
+                            transform_block(context, sig, block, mode);
                             method.attrs.push(lint_suppress_with_body());
                         } else {
                             method.attrs.push(lint_suppress_without_body());
                         }
                         let has_default = method.default.is_some();
-                        transform_sig(context, sig, has_self, has_default, is_local, try_alloc);
+                        let item = transform_sig(
+                            context,
+                            sig,
+                            has_self,
+                            has_default,
+                            is_local,
+                            false,
+                            mode,
+                        );
+
+                        fut_items.push(parse_quote!(#item));
                     }
+                }
+            }
+
+            if mode == Mode::Static {
+                for item in fut_items {
+                    input.items.push(item);
                 }
             }
         }
@@ -105,16 +124,27 @@ pub fn expand(input: &mut Item, is_local: bool, try_alloc: bool) {
                 impl_generics: &input.generics,
                 associated_type_impl_traits: &associated_type_impl_traits,
             };
+
+            let mut fut_items = Vec::new();
             for inner in &mut input.items {
                 if let ImplItem::Method(method) = inner {
                     let sig = &mut method.sig;
                     if sig.asyncness.is_some() {
                         let block = &mut method.block;
                         let has_self = has_self_in_sig(sig) || has_self_in_block(block);
-                        transform_block(context, sig, block, try_alloc);
-                        transform_sig(context, sig, has_self, false, is_local, try_alloc);
+                        transform_block(context, sig, block, mode);
+                        let item =
+                            transform_sig(context, sig, has_self, false, is_local, true, mode);
                         method.attrs.push(lint_suppress_with_body());
+
+                        fut_items.push(parse_quote!(#item));
                     }
+                }
+            }
+
+            if mode == Mode::Static {
+                for item in fut_items {
+                    input.items.push(item);
                 }
             }
         }
@@ -141,27 +171,62 @@ fn lint_suppress_without_body() -> Attribute {
     }
 }
 
-// Input:
-//     async fn f<T>(&self, x: &T) -> Ret;
-//
-// Output:
-//     fn f<'life0, 'life1, 'async_trait, T>(
-//         &'life0 self,
-//         x: &'life1 T,
-//     ) -> Pin<Box<dyn Future<Output = Ret> + Send + 'async_trait>>
-//     where
-//         'life0: 'async_trait,
-//         'life1: 'async_trait,
-//         T: 'async_trait,
-//         Self: Sync + 'async_trait;
+/// Input:
+///
+/// ```no_run
+/// async fn f<T>(&self, x: &T) -> Ret;
+/// ```
+///
+/// Output(Default):
+///
+/// ```no_run
+/// fn f<'life0, 'life1, 'async_trait, T>(
+///     &'life0 self,
+///     x: &'life1 T,
+/// ) -> Pin<Box<dyn Future<Output = Ret> + Send + 'async_trait>>
+/// where
+///     'life0: 'async_trait,
+///     'life1: 'async_trait,
+///     T: 'async_trait,
+///     Self: Sync + 'async_trait;
+/// ```
+///
+/// Output(TryAlloc):
+///
+/// ```no_run
+/// fn f<'life0, 'life1, 'async_trait, T>(
+///     &'life0 self,
+///     x: &'life1 T,
+/// ) -> Result<Pin<Box<dyn Future<Output = Ret> + Send + 'async_trait>>, AllocError>
+/// where
+///     'life0: 'async_trait,
+///     'life1: 'async_trait,
+///     T: 'async_trait,
+///     Self: Sync + 'async_trait;
+/// ```
+///
+/// Output(Static):
+///
+/// ```no_run
+/// fn f<'life0, 'life1, 'async_trait, T>(
+///     &'life0 self,
+///     x: &'life1 T,
+/// ) -> Self::FFuture<'async_trait>
+/// where
+///     'life0: 'async_trait,
+///     'life1: 'async_trait,
+///     T: 'async_trait,
+///     Self: Sync + 'async_trait;
+/// ```
 fn transform_sig(
     context: Context,
     sig: &mut Signature,
     has_self: bool,
     has_default: bool,
     is_local: bool,
-    try_alloc: bool,
-) {
+    is_impl: bool,
+    mode: Mode,
+) -> TokenStream {
     sig.fn_token.span = sig.asyncness.take().unwrap().span;
 
     let ret = match &sig.output {
@@ -286,19 +351,49 @@ fn transform_sig(
         quote_spanned!(ret_span=> ::core::marker::Send + 'async_trait)
     };
 
-    sig.output = if try_alloc {
-        parse_quote_spanned! {ret_span=>
-            -> ::core::result::Result<::core::pin::Pin<Box<
-                dyn ::core::future::Future<Output = #ret> + #bounds
-            >>, ::core::alloc::AllocError>
+    let item_name = sig.ident.to_string().to_case(Case::Pascal) + "Future";
+    let item_name = Ident::new(&item_name, sig.ident.span());
+    let fut_item = if is_impl {
+        quote! {
+            type #item_name<'async_trait> = impl ::core::future::Future<Output = #ret> + 'async_trait;
         }
     } else {
-        parse_quote_spanned! {ret_span=>
-            -> ::core::pin::Pin<Box<
-                dyn ::core::future::Future<Output = #ret> + #bounds
-            >>
+        quote! {
+            type #item_name<'async_trait>: ::core::future::Future<Output = #ret> + 'async_trait;
         }
     };
+
+    if is_impl {
+        let x: ImplItem = parse_quote!(#fut_item);
+        println!("{:?} {:?}", fut_item.to_string(), quote!(#x).to_string());
+    } else {
+        let x: TraitItem = parse_quote!(#fut_item);
+        println!("{:?} {:?}", fut_item.to_string(), quote!(#x).to_string());
+    }
+
+    let output = match mode {
+        Mode::Default => {
+            parse_quote_spanned! {ret_span=>
+                -> ::core::pin::Pin<Box<
+                    dyn ::core::future::Future<Output = #ret> + #bounds
+                >>
+            }
+        }
+        Mode::TryAlloc => {
+            parse_quote_spanned! {ret_span=>
+                -> ::core::result::Result<::core::pin::Pin<Box<
+                    dyn ::core::future::Future<Output = #ret> + #bounds
+                >>, ::core::alloc::AllocError>
+            }
+        }
+        Mode::Static => {
+            parse_quote_spanned! {ret_span=>
+                -> Self::#item_name<'async_trait>
+            }
+        }
+    };
+    sig.output = output;
+    fut_item
 }
 
 // Input:
@@ -318,7 +413,7 @@ fn transform_sig(
 //
 //         ___ret
 //     })
-fn transform_block(context: Context, sig: &mut Signature, block: &mut Block, try_alloc: bool) {
+fn transform_block(context: Context, sig: &mut Signature, block: &mut Block, mode: Mode) {
     if let Some(Stmt::Item(syn::Item::Verbatim(item))) = block.stmts.first() {
         if block.stmts.len() == 1 && item.to_string() == ";" {
             return;
@@ -393,13 +488,21 @@ fn transform_block(context: Context, sig: &mut Signature, block: &mut Block, try
         }
     };
 
-    let box_pin = if try_alloc {
-        quote_spanned!(block.brace_token.span=>
-            Ok(Box::into_pin(Box::try_new(async move { #let_ret })?))
-        )
-    } else {
-        quote_spanned!(block.brace_token.span=>
-            Box::pin(async move { #let_ret }))
+    let box_pin = match mode {
+        Mode::Default => {
+            quote_spanned!(block.brace_token.span=>
+                Box::pin(async move { #let_ret }))
+        }
+        Mode::TryAlloc => {
+            quote_spanned!(block.brace_token.span=>
+                Ok(Box::into_pin(Box::try_new(async move { #let_ret })?))
+            )
+        }
+        Mode::Static => {
+            quote_spanned!(block.brace_token.span=>
+               async move { #let_ret }
+            )
+        }
     };
     block.stmts = parse_quote!(#box_pin);
 }
