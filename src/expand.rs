@@ -2,16 +2,16 @@ use crate::parse::Item;
 use crate::receiver::{has_self_in_block, has_self_in_sig, mut_pat, ReplaceSelf};
 use crate::{lifetime::CollectLifetimes, Mode};
 use convert_case::{Case, Casing};
-use proc_macro2::{Span, TokenStream};
+use proc_macro2::TokenStream;
 use quote::{format_ident, quote, quote_spanned, ToTokens};
 use std::collections::BTreeSet as Set;
+use syn::punctuated::Punctuated;
 use syn::visit_mut::{self, VisitMut};
 use syn::{
     parse_quote, Attribute, Block, FnArg, GenericParam, Generics, Ident, ImplItem, Lifetime, Pat,
     PatIdent, Receiver, ReturnType, Signature, Stmt, Token, TraitItem, Type, TypeParamBound,
     TypePath, WhereClause,
 };
-use syn::{punctuated::Punctuated, TraitItemType};
 
 macro_rules! parse_quote_spanned {
     ($span:expr=> $($t:tt)*) => {
@@ -362,14 +362,6 @@ fn transform_sig(
             type #item_name<'async_trait>: ::core::future::Future<Output = #ret> + 'async_trait;
         }
     };
-
-    if is_impl {
-        let x: ImplItem = parse_quote!(#fut_item);
-        println!("{:?} {:?}", fut_item.to_string(), quote!(#x).to_string());
-    } else {
-        let x: TraitItem = parse_quote!(#fut_item);
-        println!("{:?} {:?}", fut_item.to_string(), quote!(#x).to_string());
-    }
 
     let output = match mode {
         Mode::Default => {
